@@ -253,7 +253,7 @@ with tab2:
                 return "background-color: #FFFBEB; color: #D97706"
             return ""
 
-        styled = disp.style.applymap(color_status, subset=["Status"]).format({
+        styled = disp.style.map(color_status, subset=["Status"]).format({
             "Nominal Tiket (Rp)": "{:,.0f}",
             "Nominal Settlement (Rp)": "{:,.0f}",
             "Selisih (Rp)": "{:,.0f}",
