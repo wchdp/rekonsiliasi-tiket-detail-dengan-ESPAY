@@ -32,6 +32,7 @@ st.markdown("""
     .badge-match    { background:#F0FDF4; color:#16A34A; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
     .badge-no-set   { background:#FEF2F2; color:#DC2626; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
     .badge-no-tiket { background:#FFFBEB; color:#D97706; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+    .badge-prepaid  { background:#F5F3FF; color:#7C3AED; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
     .info-box {
         background: #EFF6FF;
         border: 1px solid #93C5FD;
@@ -61,7 +62,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Session state ─────────────────────────────────────────────
-for k in ("df_rekon", "df_settle_raw", "processed"):
+for k in ("df_rekon", "df_settle_raw", "df_prepaid", "processed"):
     if k not in st.session_state:
         st.session_state[k] = None
 if "processed" not in st.session_state:
@@ -115,6 +116,19 @@ with tab1:
                     df_t = df_t.rename(columns={nom_col: "Nominal"})
                     df_t = df_t[df_t["St Bayar"].astype(str).str.lower().str.strip() == "paid"].copy()
                     df_t["Order ID"] = df_t["Order ID"].astype(str).str.strip()
+                    df_t["Bank"] = df_t["Bank"].astype(str).str.strip()
+
+                    # Pisahkan ESPAY vs Prepaid
+                    df_espay   = df_t[df_t["Bank"].str.upper() == "ESPAY"].copy()
+                    df_prepaid_raw = df_t[df_t["Bank"].str.upper() != "ESPAY"].copy()
+
+                    # Ringkasan prepaid per Bank
+                    prepaid_grp = (df_prepaid_raw.groupby("Bank")
+                                   .agg(jumlah_tiket=("Nominal", "count"),
+                                        nominal=("Nominal", "sum"))
+                                   .reset_index()
+                                   .rename(columns={"jumlah_tiket": "Jml Tiket", "nominal": "Nominal (Rp)"}))
+                    st.session_state.df_prepaid = prepaid_grp
 
                     # Settlement Espay
                     df_s = pd.read_excel(file_settle, sheet_name="Settlement Espay", dtype={"Order Id": str})
@@ -123,8 +137,8 @@ with tab1:
                     df_s["Order ID"] = df_s["Order ID"].astype(str).str.strip()
                     st.session_state.df_settle_raw = df_s.copy()
 
-                    # Grouping
-                    tiket_grp = (df_t.groupby("Order ID")
+                    # Grouping — hanya dari tiket ESPAY
+                    tiket_grp = (df_espay.groupby("Order ID")
                                  .agg(jumlah_tiket=("Nominal", "count"),
                                       nominal_tiket=("Nominal", "sum"))
                                  .reset_index())
@@ -169,15 +183,17 @@ with tab1:
                     st.session_state.df_rekon = df_m
                     st.session_state.processed = True
 
-                    match_c  = (df_m["Status"] == "Match").sum()
-                    no_set_c = (df_m["Status"] == "Tidak di Settlement").sum()
-                    no_tkt_c = (df_m["Status"] == "Tidak di Tiket Detail").sum()
+                    match_c    = (df_m["Status"] == "Match").sum()
+                    no_set_c   = (df_m["Status"] == "Tidak di Settlement").sum()
+                    no_tkt_c   = (df_m["Status"] == "Tidak di Tiket Detail").sum()
+                    prepaid_c  = df_prepaid_raw["Order ID"].nunique()
 
                     st.success(
-                        f"✅ Selesai — {len(df_m):,} unique Order ID  |  "
+                        f"✅ Selesai — {len(df_m):,} unique Order ID ESPAY  |  "
                         f"Match: {match_c:,}  |  "
                         f"Tidak di Settlement: {no_set_c:,}  |  "
-                        f"Tidak di Tiket Detail: {no_tkt_c:,}"
+                        f"Tidak di Tiket Detail: {no_tkt_c:,}  |  "
+                        f"Prepaid (non-ESPAY): {prepaid_c:,} Order ID"
                     )
                     st.info("Buka tab **Rekonsiliasi Order ID** atau **Ringkasan** untuk melihat hasil.")
 
@@ -372,6 +388,42 @@ with tab3:
                 </div>""", unsafe_allow_html=True)
 
         st.markdown("---")
+
+        # ── Prepaid (non-ESPAY) ───────────────────────────────
+        df_prepaid = st.session_state.df_prepaid
+        if df_prepaid is not None and len(df_prepaid):
+            st.markdown("#### 🟣 Prepaid (Transaksi Non-ESPAY di Tiket Detail)")
+
+            total_prepaid_tiket = df_prepaid["Jml Tiket"].sum()
+            total_prepaid_nom   = df_prepaid["Nominal (Rp)"].sum()
+
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Jumlah Bank Prepaid</div>
+                    <div class="metric-value" style="color:#7C3AED">{len(df_prepaid):,}</div>
+                </div>""", unsafe_allow_html=True)
+            with p2:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Total Tiket Prepaid</div>
+                    <div class="metric-value" style="color:#7C3AED">{total_prepaid_tiket:,}</div>
+                </div>""", unsafe_allow_html=True)
+            with p3:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Total Nominal Prepaid</div>
+                    <div class="metric-value" style="color:#7C3AED; font-size:15px">Rp {total_prepaid_nom:,.0f}</div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("")
+            st.dataframe(
+                df_prepaid.style.format({"Nominal (Rp)": "{:,.0f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.markdown("---")
 
         # Tabel order hilang
         hilang_df = df[df["Status"] == "Tidak di Settlement"][
