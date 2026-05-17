@@ -62,7 +62,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Session state ─────────────────────────────────────────────
-for k in ("df_rekon", "df_settle_raw", "df_prepaid", "processed"):
+for k in ("df_rekon", "df_settle_raw", "df_prepaid", "df_espay", "processed", "periode_min", "periode_max", "settle_total", "settle_filtered"):
     if k not in st.session_state:
         st.session_state[k] = None
 if "processed" not in st.session_state:
@@ -135,7 +135,27 @@ with tab1:
                     tipe_col = df_s.columns[24]
                     df_s = df_s.rename(columns={tipe_col: "Tipe", "Order Id": "Order ID"})
                     df_s["Order ID"] = df_s["Order ID"].astype(str).str.strip()
-                    st.session_state.df_settle_raw = df_s.copy()
+
+                    # ── Filter periode: ambil rentang tanggal dari kolom Created (tiket ESPAY)
+                    #    lalu filter settlement hanya pada Transaction Date di rentang yang sama
+                    df_espay["Created"] = pd.to_datetime(df_espay["Created"], errors="coerce")
+                    df_s["Transaction Date"] = pd.to_datetime(df_s["Transaction Date"], errors="coerce")
+
+                    periode_min = df_espay["Created"].min().normalize()  # awal hari pertama
+                    periode_max = df_espay["Created"].max().normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  # akhir hari terakhir
+
+                    df_s_filtered = df_s[
+                        (df_s["Transaction Date"] >= periode_min) &
+                        (df_s["Transaction Date"] <= periode_max)
+                    ].copy()
+
+                    # Simpan info periode untuk ditampilkan
+                    st.session_state.periode_min = periode_min
+                    st.session_state.periode_max = periode_max
+                    st.session_state.settle_total   = len(df_s)
+                    st.session_state.settle_filtered = len(df_s_filtered)
+
+                    st.session_state.df_settle_raw = df_s_filtered.copy()
 
                     # Grouping — hanya dari tiket ESPAY
                     tiket_grp = (df_espay.groupby("Order ID")
@@ -143,7 +163,7 @@ with tab1:
                                       nominal_tiket=("Nominal", "sum"))
                                  .reset_index())
 
-                    settle_grp = (df_s.groupby("Order ID")
+                    settle_grp = (df_s_filtered.groupby("Order ID")
                                   .agg(jumlah_settle=("Amount", "count"),
                                        nominal_settle=("Amount", "sum"),
                                        bank=("BANK", lambda x: x.mode().iloc[0] if len(x) else ""),
@@ -180,8 +200,9 @@ with tab1:
                         "tipe":           "Tipe",
                     }).reset_index(drop=True)
 
-                    st.session_state.df_rekon = df_m
-                    st.session_state.processed = True
+                    st.session_state.df_rekon   = df_m
+                    st.session_state.df_espay   = df_espay
+                    st.session_state.processed  = True
 
                     match_c    = (df_m["Status"] == "Match").sum()
                     no_set_c   = (df_m["Status"] == "Tidak di Settlement").sum()
@@ -194,6 +215,10 @@ with tab1:
                         f"Tidak di Settlement: {no_set_c:,}  |  "
                         f"Tidak di Tiket Detail: {no_tkt_c:,}  |  "
                         f"Prepaid (non-ESPAY): {prepaid_c:,} Order ID"
+                    )
+                    st.info(
+                        f"📅 Periode tiket: **{periode_min.strftime('%d %b %Y')}** s/d **{df_espay['Created'].max().strftime('%d %b %Y')}**  |  "
+                        f"Settlement dibaca: **{len(df_s_filtered):,}** dari {len(df_s):,} baris total"
                     )
                     st.info("Buka tab **Rekonsiliasi Order ID** atau **Ringkasan** untuk melihat hasil.")
 
@@ -308,7 +333,19 @@ with tab3:
 
         st.markdown("### Ringkasan Rekonsiliasi")
 
-        # Row 1 — jumlah order
+        # Info periode
+        if st.session_state.get("periode_min") is not None:
+            p_min = st.session_state.periode_min
+            p_max = st.session_state.periode_max
+            s_tot = st.session_state.settle_total
+            s_fil = st.session_state.settle_filtered
+            st.markdown(
+                f'<div class="info-box">📅 <b>Periode Tiket Detail (ESPAY):</b> '
+                f'{p_min.strftime("%d %b %Y")} s/d {p_max.strftime("%d %b %Y")} &nbsp;|&nbsp; '
+                f'Settlement digunakan: <b>{s_fil:,}</b> dari {s_tot:,} baris total</div>',
+                unsafe_allow_html=True
+            )
+            st.markdown("")
         c1, c2, c3, c4, c5 = st.columns(5)
         metrics_row1 = [
             (c1, "Unique Order — Tiket Detail", f"{total_uord:,}", "#2563EB"),
@@ -425,14 +462,66 @@ with tab3:
             )
             st.markdown("---")
 
-        # Tabel order hilang
-        hilang_df = df[df["Status"] == "Tidak di Settlement"][
-            ["Order ID", "Nominal Tiket (Rp)", "Jml Tiket"]].head(200)
-        if len(hilang_df):
-            st.markdown(f"#### 🔴 Order ID Tidak Ada di Settlement ({no_set_c:,} total, menampilkan maks 200)")
+        # ── Tabel 1: Order ID ada di Tiket ESPAY tapi tidak ada di Settlement ──
+        st.markdown("---")
+        hilang_set_df = df[df["Status"] == "Tidak di Settlement"][
+            ["Order ID", "Nominal Tiket (Rp)", "Jml Tiket"]].copy()
+
+        # Gabungkan kolom Golongan dari df_espay
+        df_espay_ss = st.session_state.df_espay
+        if df_espay_ss is not None:
+            golongan_map = (df_espay_ss.groupby("Order ID")["Golongan"]
+                            .apply(lambda x: ", ".join(x.astype(str).unique()))
+                            .reset_index()
+                            .rename(columns={"Golongan": "Golongan"}))
+            hilang_set_df = hilang_set_df.merge(golongan_map, on="Order ID", how="left")
+            hilang_set_df = hilang_set_df[["Order ID", "Golongan", "Jml Tiket", "Nominal Tiket (Rp)"]]
+
+        st.markdown(f"#### 🔴 Tiket ESPAY Tidak Ada di Settlement ({no_set_c:,} Order ID)")
+        if len(hilang_set_df):
             st.dataframe(
-                hilang_df.style.format({"Nominal Tiket (Rp)": "{:,.0f}"}),
+                hilang_set_df.style.format({"Nominal Tiket (Rp)": "{:,.0f}"}),
                 use_container_width=True,
                 hide_index=True,
-                height=300,
+                height=min(400, 35 * len(hilang_set_df) + 38),
             )
+        else:
+            st.success("✅ Tidak ada tiket ESPAY yang hilang di Settlement.")
+
+        # ── Tabel 2: Order ID ada di Settlement tapi tidak ada di Tiket Detail ──
+        st.markdown("---")
+        lebih_set_df = df[df["Status"] == "Tidak di Tiket Detail"][["Order ID"]].copy()
+
+        # Gabungkan detail dari df_settle_raw
+        if df_s_raw is not None and len(lebih_set_df):
+            settle_detail = (df_s_raw[df_s_raw["Order ID"].isin(lebih_set_df["Order ID"])]
+                             [["Order ID", "Transaction Date", "BANK", "Tipe", "Amount"]]
+                             .copy())
+            settle_detail["Transaction Date"] = pd.to_datetime(
+                settle_detail["Transaction Date"], errors="coerce"
+            ).dt.strftime("%d %b %Y %H:%M")
+            lebih_detail_df = (settle_detail.groupby("Order ID")
+                               .agg(
+                                   Transaction_Date=("Transaction Date", "first"),
+                                   Bank=("BANK", lambda x: x.mode().iloc[0] if len(x) else ""),
+                                   Tipe=("Tipe", lambda x: x.mode().iloc[0] if len(x) else ""),
+                                   Amount=("Amount", "sum"),
+                               )
+                               .reset_index()
+                               .rename(columns={
+                                   "Transaction_Date": "Transaction Date",
+                                   "Amount": "Amount (Rp)",
+                               }))
+        else:
+            lebih_detail_df = pd.DataFrame(columns=["Order ID", "Transaction Date", "Bank", "Tipe", "Amount (Rp)"])
+
+        st.markdown(f"#### 🟡 Settlement Tidak Ada di Tiket Detail ({no_tkt_c:,} Order ID)")
+        if len(lebih_detail_df):
+            st.dataframe(
+                lebih_detail_df.style.format({"Amount (Rp)": "{:,.0f}"}),
+                use_container_width=True,
+                hide_index=True,
+                height=min(400, 35 * len(lebih_detail_df) + 38),
+            )
+        else:
+            st.success("✅ Tidak ada Order ID di Settlement yang tidak ditemukan di Tiket Detail.")
