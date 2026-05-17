@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 from datetime import datetime
 
 st.set_page_config(
@@ -41,9 +42,38 @@ st.markdown("""
         color: #1E40AF;
         font-size: 14px;
     }
+    .warn-box {
+        background: #FFF7ED;
+        border: 1px solid #FDBA74;
+        border-radius: 8px;
+        padding: 14px 18px;
+        color: #9A3412;
+        font-size: 14px;
+    }
     .bank-card {
         background: #EFF6FF;
         border: 1px solid #93C5FD;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 8px;
+    }
+    .green-card {
+        background: #F0FDF4;
+        border: 1px solid #86EFAC;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 8px;
+    }
+    .purple-card {
+        background: #F5F3FF;
+        border: 1px solid #C4B5FD;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 8px;
+    }
+    .red-card {
+        background: #FEF2F2;
+        border: 1px solid #FECACA;
         border-radius: 8px;
         padding: 12px 16px;
         margin-bottom: 8px;
@@ -62,21 +92,285 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Session state ─────────────────────────────────────────────
-for k in ("df_rekon", "df_settle_raw", "df_prepaid", "df_espay", "processed", "periode_min", "periode_max", "settle_total", "settle_filtered"):
+for k in (
+    "df_rekon", "df_settle_raw", "df_prepaid", "df_prepaid_raw",
+    "df_espay", "processed", "periode_min", "periode_max",
+    "settle_total", "settle_filtered",
+    "df_bank_bri", "df_bank_bca", "df_bank_mandiri",
+    "bank_processed",
+):
     if k not in st.session_state:
         st.session_state[k] = None
 if "processed" not in st.session_state:
     st.session_state.processed = False
+if "bank_processed" not in st.session_state:
+    st.session_state.bank_processed = False
+
+# ══════════════════════════════════════════════════════════════
+# HELPER — Klasifikasi baris rekening koran
+# ══════════════════════════════════════════════════════════════
+
+def extract_mrc_id(keterangan: str) -> str | None:
+    """Ekstrak 18 karakter mulai dari 'mrc' di kolom keterangan."""
+    kl = str(keterangan).lower()
+    idx = kl.find("mrc")
+    if idx == -1:
+        return None
+    return keterangan[idx: idx + 18]
+
+def classify_bank_row(keterangan: str, nominal: float, bank_type: str,
+                      espay_settlement_df: pd.DataFrame | None) -> dict:
+    """
+    Klasifikasi satu baris rekening koran sesuai rumus Excel:
+
+    BRI:
+      - Jika ada 'mrc' → cari di Settlement Espay → dapat = ESPAY / tidak dapat = Prepaid
+      - Jika ada 'Pinbuk' → Transfer NON BCA
+      - Lainnya → Prepaid (OnUs)
+
+    BCA:
+      - Jika ada 'mrc' → cari di Settlement Espay → dapat = ESPAY / tidak dapat = Cash
+      - Jika ada 'KR OTOMATIS' DAN 'MID' → Transfer BCA
+      - Lainnya → Cash
+
+    MANDIRI:
+      - Jika ada 'mrc' → cari di Settlement Espay → dapat = ESPAY / tidak dapat = Prepaid
+      - Jika ada 'SWITCHING' atau 'EDC' atau 'MTRANSFER' → Transfer / NON MANDIRI
+      - Lainnya → Prepaid (OnUs)
+    """
+    ket = str(keterangan)
+    ket_up = ket.upper()
+    mrc_id = extract_mrc_id(ket)
+
+    kategori   = "Lainnya"
+    tipe       = "-"
+    order_match = None
+
+    if mrc_id and espay_settlement_df is not None and len(espay_settlement_df):
+        # Coba match ke kolom R (Transaction ID / referensi) di Settlement Espay
+        # Kolom R = indeks 17 (0-based)
+        ref_col    = espay_settlement_df.columns[17] if len(espay_settlement_df.columns) > 17 else None
+        tipe_col   = espay_settlement_df.columns[24] if len(espay_settlement_df.columns) > 24 else None  # col Y
+        status_col = espay_settlement_df.columns[26] if len(espay_settlement_df.columns) > 26 else None  # col AA
+
+        if ref_col is not None:
+            matched = espay_settlement_df[
+                espay_settlement_df[ref_col].astype(str).str.strip().str[:18] == mrc_id.strip()
+            ]
+            if len(matched):
+                kategori    = "ESPAY"
+                order_match = mrc_id
+                if status_col and status_col in espay_settlement_df.columns:
+                    tipe = str(matched.iloc[0][status_col])
+                elif tipe_col and tipe_col in espay_settlement_df.columns:
+                    tipe = str(matched.iloc[0][tipe_col])
+                else:
+                    tipe = "ESPAY"
+            else:
+                # Tidak ketemu di settlement → Prepaid/Cash sesuai bank
+                kategori = "Prepaid" if bank_type in ("BRI", "MANDIRI") else "Cash"
+                tipe     = "OnUs"
+        else:
+            kategori = "Prepaid" if bank_type in ("BRI", "MANDIRI") else "Cash"
+            tipe     = "OnUs"
+
+    else:
+        # Tidak ada 'mrc'
+        if bank_type == "BRI":
+            if "PINBUK" in ket_up:
+                kategori = "Transfer"
+                tipe     = "NON BCA"
+            else:
+                kategori = "Prepaid"
+                tipe     = "OnUs"
+
+        elif bank_type == "BCA":
+            if "KR OTOMATIS" in ket_up and "MID" in ket_up:
+                kategori = "Transfer"
+                tipe     = "BCA"
+            else:
+                kategori = "Cash"
+                tipe     = "Cash"
+
+        elif bank_type == "MANDIRI":
+            if any(x in ket_up for x in ["SWITCHING", "EDC", "MTRANSFER", "TRANSFER"]):
+                kategori = "Transfer"
+                tipe     = "NON MANDIRI"
+            else:
+                kategori = "Prepaid"
+                tipe     = "OnUs"
+
+    return {
+        "kategori":  kategori,
+        "tipe":      tipe,
+        "order_ref": order_match,
+    }
+
+
+def process_bank_file(file, bank_type: str,
+                      espay_settlement_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Baca rekening koran excel.
+    Format yang didukung: kolom Tanggal | Keterangan | Nominal (kredit/debet).
+    Hanya baris dengan Nominal > 0 (uang masuk) yang diproses.
+    """
+    # Baca semua sheet, coba sheet pertama atau yang mengandung 'koran'/'bank'
+    xl = pd.ExcelFile(file)
+    target_sheet = xl.sheet_names[0]
+    for s in xl.sheet_names:
+        if any(x in s.lower() for x in ["koran", "bank", "rekening", "mutasi"]):
+            target_sheet = s
+            break
+
+    df = pd.read_excel(file, sheet_name=target_sheet, dtype=str)
+    df.columns = df.columns.str.strip()
+
+    # Deteksi kolom Tanggal
+    tgl_col = None
+    for c in df.columns:
+        if any(x in c.lower() for x in ["tanggal", "date", "tgl"]):
+            tgl_col = c
+            break
+    if tgl_col is None:
+        tgl_col = df.columns[0]
+
+    # Deteksi kolom Keterangan
+    ket_col = None
+    for c in df.columns:
+        if any(x in c.lower() for x in ["keterangan", "deskripsi", "description", "remark", "uraian"]):
+            ket_col = c
+            break
+    if ket_col is None:
+        ket_col = df.columns[1]
+
+    # Deteksi kolom Nominal (kredit / masuk)
+    nom_col = None
+    for c in df.columns:
+        if any(x in c.lower() for x in ["kredit", "masuk", "credit", "nominal", "jumlah", "amount"]):
+            nom_col = c
+            break
+    if nom_col is None:
+        nom_col = df.columns[2]
+
+    df = df[[tgl_col, ket_col, nom_col]].copy()
+    df.columns = ["Tanggal", "Keterangan", "Nominal"]
+
+    # Bersihkan nominal
+    df["Nominal"] = (
+        df["Nominal"]
+        .astype(str)
+        .str.replace(r"[^\d\.]", "", regex=True)
+        .replace("", "0")
+    )
+    df["Nominal"] = pd.to_numeric(df["Nominal"], errors="coerce").fillna(0)
+
+    # Bersihkan tanggal
+    df["Tanggal"] = pd.to_datetime(df["Tanggal"], errors="coerce")
+
+    # Hanya baris uang masuk (Nominal > 0) dan tanggal valid
+    df = df[(df["Nominal"] > 0) & (df["Tanggal"].notna())].copy()
+    df = df.reset_index(drop=True)
+
+    if len(df) == 0:
+        return df
+
+    # Klasifikasi
+    results = df.apply(
+        lambda row: classify_bank_row(
+            row["Keterangan"], row["Nominal"], bank_type, espay_settlement_df
+        ),
+        axis=1,
+        result_type="expand",
+    )
+    df["Kategori"]   = results["kategori"]
+    df["Tipe"]       = results["tipe"]
+    df["Order Ref"]  = results["order_ref"]
+    df["Bank"]       = bank_type
+
+    return df
+
+
+def detect_prepaid_shortfall(df_prepaid_raw: pd.DataFrame,
+                              df_bank: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Bandingkan nominal kumulatif harian Prepaid di tiket detail
+    dengan uang masuk Prepaid di rekening koran (kategori Prepaid / OnUs).
+    Jika ada tanggal yang nominal bank < nominal tiket → kurang settlement.
+    """
+    if df_prepaid_raw is None or len(df_prepaid_raw) == 0:
+        return pd.DataFrame()
+
+    # Hitung kumulatif harian dari tiket detail prepaid
+    df_t = df_prepaid_raw.copy()
+    # Coba kolom tanggal transaksi
+    date_col = None
+    for c in df_t.columns:
+        if any(x in c.lower() for x in ["created", "tanggal", "date", "tgl", "waktu"]):
+            date_col = c
+            break
+    if date_col is None:
+        return pd.DataFrame()
+
+    df_t["_tgl"] = pd.to_datetime(df_t[date_col], errors="coerce").dt.normalize()
+    daily_tiket = (
+        df_t[df_t["_tgl"].notna()]
+        .groupby("_tgl")["Nominal"]
+        .sum()
+        .reset_index()
+        .rename(columns={"_tgl": "Tanggal", "Nominal": "Total Tiket (Rp)"})
+    )
+
+    if df_bank is None or len(df_bank) == 0:
+        # Tidak ada data bank — tampilkan semua hari sebagai tidak terverifikasi
+        daily_tiket["Total Bank Masuk (Rp)"] = None
+        daily_tiket["Selisih (Rp)"]          = None
+        daily_tiket["Status"]                = "⚠️ Belum ada data bank"
+        return daily_tiket
+
+    # Hitung uang masuk Prepaid / OnUs di rekening koran
+    df_b = df_bank[df_bank["Kategori"].isin(["Prepaid", "Cash"])].copy()
+    df_b["_tgl"] = pd.to_datetime(df_b["Tanggal"], errors="coerce").dt.normalize()
+    daily_bank = (
+        df_b[df_b["_tgl"].notna()]
+        .groupby("_tgl")["Nominal"]
+        .sum()
+        .reset_index()
+        .rename(columns={"_tgl": "Tanggal", "Nominal": "Total Bank Masuk (Rp)"})
+    )
+
+    merged = pd.merge(daily_tiket, daily_bank, on="Tanggal", how="left")
+    merged["Total Bank Masuk (Rp)"] = merged["Total Bank Masuk (Rp)"].fillna(0)
+    merged["Selisih (Rp)"] = merged["Total Bank Masuk (Rp)"] - merged["Total Tiket (Rp)"]
+
+    def status_fn(row):
+        if row["Total Bank Masuk (Rp)"] == 0:
+            return "🔴 Tidak ada masuk di bank"
+        elif row["Selisih (Rp)"] < 0:
+            return "🟠 Kurang Settlement"
+        elif row["Selisih (Rp)"] > 0:
+            return "🔵 Lebih Settlement"
+        else:
+            return "✅ Sesuai"
+
+    merged["Status"] = merged.apply(status_fn, axis=1)
+    merged["Tanggal"] = merged["Tanggal"].dt.strftime("%d %b %Y")
+    return merged
+
 
 # ── Tabs ──────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["   📂 Upload File   ", "   🔍 Rekonsiliasi Order ID   ", "   📊 Ringkasan   "])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "   📂 Upload File   ",
+    "   🔍 Rekonsiliasi Order ID   ",
+    "   📊 Ringkasan   ",
+    "   🏦 Data Bank   ",
+])
 
 # ══════════════════════════════════════════════════════════════
 # TAB 1 — Upload File
 # ══════════════════════════════════════════════════════════════
 with tab1:
     st.markdown("### Upload File Excel")
-    st.markdown("Pilih file Excel untuk **Tiket Detail** dan **Settlement Espay**. Boleh file yang sama.")
+    st.markdown("Pilih file Excel untuk **Tiket Detail**, **Settlement Espay**, dan opsional **Rekening Koran Bank**.")
 
     col1, col2 = st.columns(2)
 
@@ -91,13 +385,69 @@ with tab1:
         file_settle = st.file_uploader("Upload file Settlement Espay", type=["xlsx", "xls"], key="settle")
 
     st.markdown("---")
+    st.markdown("#### 🏦 Rekening Koran Bank _(opsional)_")
+    st.markdown("Upload rekening koran untuk memverifikasi uang masuk dari settlement ESPAY maupun Prepaid.")
+
+    # Format note rekening koran
+    st.markdown("""
+<div class="warn-box">
+<b>📋 Format File Rekening Koran yang Didukung:</b><br>
+File Excel dengan kolom berikut (nama kolom fleksibel, urutan sesuai):<br><br>
+<table style="width:100%; border-collapse:collapse; font-size:13px;">
+  <tr style="background:#FED7AA">
+    <th style="padding:6px 10px; text-align:left; border:1px solid #FDBA74">Kolom</th>
+    <th style="padding:6px 10px; text-align:left; border:1px solid #FDBA74">Nama yang Dikenali</th>
+    <th style="padding:6px 10px; text-align:left; border:1px solid #FDBA74">Keterangan</th>
+  </tr>
+  <tr>
+    <td style="padding:6px 10px; border:1px solid #FDBA74"><b>Tanggal</b></td>
+    <td style="padding:6px 10px; border:1px solid #FDBA74">Tanggal / Date / Tgl</td>
+    <td style="padding:6px 10px; border:1px solid #FDBA74">Tanggal transaksi</td>
+  </tr>
+  <tr style="background:#FFF7ED">
+    <td style="padding:6px 10px; border:1px solid #FDBA74"><b>Keterangan</b></td>
+    <td style="padding:6px 10px; border:1px solid #FDBA74">Keterangan / Deskripsi / Uraian / Remark</td>
+    <td style="padding:6px 10px; border:1px solid #FDBA74">Deskripsi transaksi (digunakan untuk klasifikasi)</td>
+  </tr>
+  <tr>
+    <td style="padding:6px 10px; border:1px solid #FDBA74"><b>Nominal</b></td>
+    <td style="padding:6px 10px; border:1px solid #FDBA74">Kredit / Masuk / Nominal / Jumlah / Amount</td>
+    <td style="padding:6px 10px; border:1px solid #FDBA74">Nilai uang <b>masuk</b> (kredit). Baris dengan nominal 0 diabaikan.</td>
+  </tr>
+</table>
+<br>
+<b>Logika Klasifikasi Transaksi:</b><br>
+• Keterangan mengandung <b>"mrc"</b> → dicek ke data Settlement Espay → <b>ESPAY</b> (jika ditemukan)<br>
+• BRI: Keterangan mengandung <b>"Pinbuk"</b> → Transfer NON BCA &nbsp;|&nbsp; Tidak ada keduanya → <b>Prepaid (OnUs)</b><br>
+• BCA: Keterangan mengandung <b>"KR OTOMATIS"</b> + <b>"MID"</b> → Transfer BCA &nbsp;|&nbsp; Tidak ada → Cash<br>
+• Mandiri: Keterangan mengandung <b>"SWITCHING / EDC / MTRANSFER"</b> → Transfer NON MANDIRI &nbsp;|&nbsp; Tidak ada → <b>Prepaid (OnUs)</b>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown("")
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        st.markdown("**🏦 Rekening Koran BRI**")
+        st.caption("Sheet pertama atau sheet yang mengandung kata 'koran'/'mutasi'")
+        file_bri = st.file_uploader("Upload Rekening Koran BRI", type=["xlsx", "xls"], key="bri")
+    with bc2:
+        st.markdown("**🏦 Rekening Koran BCA**")
+        st.caption("Sheet pertama atau sheet yang mengandung kata 'koran'/'mutasi'")
+        file_bca = st.file_uploader("Upload Rekening Koran BCA", type=["xlsx", "xls"], key="bca")
+    with bc3:
+        st.markdown("**🏦 Rekening Koran Mandiri**")
+        st.caption("Sheet pertama atau sheet yang mengandung kata 'koran'/'mutasi'")
+        file_mandiri = st.file_uploader("Upload Rekening Koran Mandiri", type=["xlsx", "xls"], key="mandiri")
+
+    st.markdown("---")
 
     st.markdown("""
 <div class="info-box">
 <b>Cara Pakai:</b><br>
 1. Upload file Excel Rekonsiliasi Cabang (untuk Tiket Detail).<br>
 2. Upload file yang sama atau file lain untuk Settlement Espay.<br>
-3. Klik <b>Proses Rekonsiliasi</b> — hasil muncul di tab Rekonsiliasi Order ID dan Ringkasan.
+3. (Opsional) Upload Rekening Koran BRI, BCA, dan/atau Mandiri untuk verifikasi uang masuk.<br>
+4. Klik <b>Proses Rekonsiliasi</b> — hasil muncul di tab Rekonsiliasi Order ID, Ringkasan, dan Data Bank.
 </div>
 """, unsafe_allow_html=True)
 
@@ -110,7 +460,7 @@ with tab1:
         else:
             with st.spinner("Membaca dan memproses data..."):
                 try:
-                    # Tiket Detail
+                    # ── Tiket Detail ─────────────────────────────────────
                     df_t = pd.read_excel(file_tiket, sheet_name="Tiket Detail", dtype={"Order ID": str})
                     nom_col = df_t.columns[24]
                     df_t = df_t.rename(columns={nom_col: "Nominal"})
@@ -119,8 +469,12 @@ with tab1:
                     df_t["Bank"] = df_t["Bank"].astype(str).str.strip()
 
                     # Pisahkan ESPAY vs Prepaid
-                    df_espay   = df_t[df_t["Bank"].str.upper() == "ESPAY"].copy()
-                    df_prepaid_raw = df_t[df_t["Bank"].str.upper() != "ESPAY"].copy()
+                    # ESPAY: Bank = "ESPAY" atau "ESPAY MANDIRI" / "MANDIRI ESPAY"
+                    espay_mask = (
+                        df_t["Bank"].str.upper().str.contains("ESPAY", na=False)
+                    )
+                    df_espay       = df_t[espay_mask].copy()
+                    df_prepaid_raw = df_t[~espay_mask].copy()
 
                     # Ringkasan prepaid per Bank
                     prepaid_grp = (df_prepaid_raw.groupby("Bank")
@@ -128,36 +482,35 @@ with tab1:
                                         nominal=("Nominal", "sum"))
                                    .reset_index()
                                    .rename(columns={"jumlah_tiket": "Jml Tiket", "nominal": "Nominal (Rp)"}))
-                    st.session_state.df_prepaid = prepaid_grp
+                    st.session_state.df_prepaid     = prepaid_grp
+                    st.session_state.df_prepaid_raw = df_prepaid_raw
 
-                    # Settlement Espay
+                    # ── Settlement Espay ──────────────────────────────────
                     df_s = pd.read_excel(file_settle, sheet_name="Settlement Espay", dtype={"Order Id": str})
                     tipe_col = df_s.columns[24]
                     df_s = df_s.rename(columns={tipe_col: "Tipe", "Order Id": "Order ID"})
                     df_s["Order ID"] = df_s["Order ID"].astype(str).str.strip()
 
-                    # ── Filter periode: ambil rentang tanggal dari kolom Created (tiket ESPAY)
-                    #    lalu filter settlement hanya pada Transaction Date di rentang yang sama
+                    # Filter periode: rentang tanggal dari tiket ESPAY
                     df_espay["Created"] = pd.to_datetime(df_espay["Created"], errors="coerce")
                     df_s["Transaction Date"] = pd.to_datetime(df_s["Transaction Date"], errors="coerce")
 
-                    periode_min = df_espay["Created"].min().normalize()  # awal hari pertama
-                    periode_max = df_espay["Created"].max().normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  # akhir hari terakhir
+                    periode_min = df_espay["Created"].min().normalize()
+                    periode_max = (df_espay["Created"].max().normalize()
+                                   + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
 
                     df_s_filtered = df_s[
                         (df_s["Transaction Date"] >= periode_min) &
                         (df_s["Transaction Date"] <= periode_max)
                     ].copy()
 
-                    # Simpan info periode untuk ditampilkan
-                    st.session_state.periode_min = periode_min
-                    st.session_state.periode_max = periode_max
-                    st.session_state.settle_total   = len(df_s)
+                    st.session_state.periode_min     = periode_min
+                    st.session_state.periode_max     = periode_max
+                    st.session_state.settle_total    = len(df_s)
                     st.session_state.settle_filtered = len(df_s_filtered)
+                    st.session_state.df_settle_raw   = df_s_filtered.copy()
 
-                    st.session_state.df_settle_raw = df_s_filtered.copy()
-
-                    # Grouping — hanya dari tiket ESPAY
+                    # ── Grouping rekonsiliasi ─────────────────────────────
                     tiket_grp = (df_espay.groupby("Order ID")
                                  .agg(jumlah_tiket=("Nominal", "count"),
                                       nominal_tiket=("Nominal", "sum"))
@@ -200,14 +553,46 @@ with tab1:
                         "tipe":           "Tipe",
                     }).reset_index(drop=True)
 
-                    st.session_state.df_rekon   = df_m
-                    st.session_state.df_espay   = df_espay
-                    st.session_state.processed  = True
+                    st.session_state.df_rekon  = df_m
+                    st.session_state.df_espay  = df_espay
+                    st.session_state.processed = True
 
-                    match_c    = (df_m["Status"] == "Match").sum()
-                    no_set_c   = (df_m["Status"] == "Tidak di Settlement").sum()
-                    no_tkt_c   = (df_m["Status"] == "Tidak di Tiket Detail").sum()
-                    prepaid_c  = df_prepaid_raw["Order ID"].nunique()
+                    # ── Proses Rekening Koran Bank ────────────────────────
+                    # Simpan df_s agar bisa digunakan saat klasifikasi bank
+                    espay_for_bank = df_s.copy()
+
+                    df_bank_bri     = None
+                    df_bank_bca     = None
+                    df_bank_mandiri = None
+
+                    if file_bri:
+                        df_bank_bri = process_bank_file(file_bri, "BRI", espay_for_bank)
+                        st.session_state.df_bank_bri = df_bank_bri
+
+                    if file_bca:
+                        df_bank_bca = process_bank_file(file_bca, "BCA", espay_for_bank)
+                        st.session_state.df_bank_bca = df_bank_bca
+
+                    if file_mandiri:
+                        df_bank_mandiri = process_bank_file(file_mandiri, "MANDIRI", espay_for_bank)
+                        st.session_state.df_bank_mandiri = df_bank_mandiri
+
+                    if file_bri or file_bca or file_mandiri:
+                        st.session_state.bank_processed = True
+
+                    # Summary counts
+                    match_c   = (df_m["Status"] == "Match").sum()
+                    no_set_c  = (df_m["Status"] == "Tidak di Settlement").sum()
+                    no_tkt_c  = (df_m["Status"] == "Tidak di Tiket Detail").sum()
+                    prepaid_c = df_prepaid_raw["Order ID"].nunique()
+
+                    bank_info = ""
+                    if file_bri and df_bank_bri is not None:
+                        bank_info += f"  |  BRI: {len(df_bank_bri):,} baris"
+                    if file_bca and df_bank_bca is not None:
+                        bank_info += f"  |  BCA: {len(df_bank_bca):,} baris"
+                    if file_mandiri and df_bank_mandiri is not None:
+                        bank_info += f"  |  Mandiri: {len(df_bank_mandiri):,} baris"
 
                     st.success(
                         f"✅ Selesai — {len(df_m):,} unique Order ID ESPAY  |  "
@@ -215,12 +600,14 @@ with tab1:
                         f"Tidak di Settlement: {no_set_c:,}  |  "
                         f"Tidak di Tiket Detail: {no_tkt_c:,}  |  "
                         f"Prepaid (non-ESPAY): {prepaid_c:,} Order ID"
+                        + bank_info
                     )
                     st.info(
-                        f"📅 Periode tiket: **{periode_min.strftime('%d %b %Y')}** s/d **{df_espay['Created'].max().strftime('%d %b %Y')}**  |  "
+                        f"📅 Periode tiket: **{periode_min.strftime('%d %b %Y')}** s/d "
+                        f"**{df_espay['Created'].max().strftime('%d %b %Y')}**  |  "
                         f"Settlement dibaca: **{len(df_s_filtered):,}** dari {len(df_s):,} baris total"
                     )
-                    st.info("Buka tab **Rekonsiliasi Order ID** atau **Ringkasan** untuk melihat hasil.")
+                    st.info("Buka tab **Rekonsiliasi Order ID**, **Ringkasan**, atau **Data Bank** untuk melihat hasil.")
 
                 except Exception as e:
                     import traceback
@@ -317,7 +704,7 @@ with tab3:
     if st.session_state.df_rekon is None:
         st.info("Belum ada data. Proses rekonsiliasi terlebih dahulu di tab **Upload File**.")
     else:
-        df      = st.session_state.df_rekon
+        df       = st.session_state.df_rekon
         df_s_raw = st.session_state.df_settle_raw
 
         match_c    = (df["Status"] == "Match").sum()
@@ -346,6 +733,7 @@ with tab3:
                 unsafe_allow_html=True
             )
             st.markdown("")
+
         c1, c2, c3, c4, c5 = st.columns(5)
         metrics_row1 = [
             (c1, "Unique Order — Tiket Detail", f"{total_uord:,}", "#2563EB"),
@@ -462,12 +850,78 @@ with tab3:
             )
             st.markdown("---")
 
-        # ── Tabel 1: Order ID ada di Tiket ESPAY tapi tidak ada di Settlement ──
+        # ── Tabel Kurang Settlement Prepaid ───────────────────
+        df_prepaid_raw = st.session_state.df_prepaid_raw
+        df_bank_bri    = st.session_state.df_bank_bri
+        df_bank_bca    = st.session_state.df_bank_bca
+        df_bank_mandiri = st.session_state.df_bank_mandiri
+
+        st.markdown("#### 🟠 Kurang Settlement Prepaid (Perbandingan Tiket vs Uang Masuk Bank)")
+
+        if df_prepaid_raw is not None and len(df_prepaid_raw):
+            # Gabungkan semua data bank
+            bank_frames = []
+            if df_bank_bri is not None and len(df_bank_bri):
+                bank_frames.append(df_bank_bri)
+            if df_bank_bca is not None and len(df_bank_bca):
+                bank_frames.append(df_bank_bca)
+            if df_bank_mandiri is not None and len(df_bank_mandiri):
+                bank_frames.append(df_bank_mandiri)
+            df_bank_all = pd.concat(bank_frames, ignore_index=True) if bank_frames else None
+
+            shortfall_df = detect_prepaid_shortfall(df_prepaid_raw, df_bank_all)
+
+            if len(shortfall_df):
+                # Warna status
+                def color_shortfall(val):
+                    if "Kurang" in str(val):
+                        return "background-color: #FFF7ED; color: #C2410C"
+                    elif "Tidak ada" in str(val):
+                        return "background-color: #FEF2F2; color: #DC2626"
+                    elif "Lebih" in str(val):
+                        return "background-color: #EFF6FF; color: #1D4ED8"
+                    elif "Sesuai" in str(val):
+                        return "background-color: #F0FDF4; color: #15803D"
+                    return ""
+
+                fmt_dict = {}
+                if "Total Tiket (Rp)" in shortfall_df.columns:
+                    fmt_dict["Total Tiket (Rp)"] = "{:,.0f}"
+                if "Total Bank Masuk (Rp)" in shortfall_df.columns:
+                    fmt_dict["Total Bank Masuk (Rp)"] = lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
+                if "Selisih (Rp)" in shortfall_df.columns:
+                    fmt_dict["Selisih (Rp)"] = lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
+
+                styled_sf = shortfall_df.style.map(color_shortfall, subset=["Status"]).format(fmt_dict)
+                st.dataframe(styled_sf, use_container_width=True, hide_index=True,
+                             height=min(400, 35 * len(shortfall_df) + 38))
+
+                # Ringkasan shortfall
+                if "Selisih (Rp)" in shortfall_df.columns:
+                    total_kurang = shortfall_df[shortfall_df["Status"].str.contains("Kurang", na=False)]["Selisih (Rp)"].sum()
+                    hari_kurang  = (shortfall_df["Status"].str.contains("Kurang", na=False)).sum()
+                    hari_kosong  = (shortfall_df["Status"].str.contains("Tidak ada", na=False)).sum()
+                    if total_kurang != 0 or hari_kosong:
+                        st.markdown(f"""
+<div class="warn-box">
+⚠️ <b>{hari_kurang} hari</b> dengan kurang settlement prepaid &nbsp;|&nbsp;
+<b>{hari_kosong} hari</b> tanpa uang masuk di bank &nbsp;|&nbsp;
+Total kurang: <b>Rp {abs(total_kurang):,.0f}</b><br>
+<small>Catatan: Nilai settlement prepaid mengikuti data cut-off di Tiket Detail.
+Pastikan rekening koran yang diupload mencakup seluruh periode.</small>
+</div>""", unsafe_allow_html=True)
+                    else:
+                        st.success("✅ Semua hari prepaid telah ter-settlement dengan baik.")
+            else:
+                st.warning("⚠️ Tidak dapat mendeteksi kolom tanggal di data Prepaid. Pastikan kolom 'Created' tersedia di Tiket Detail.")
+        else:
+            st.info("Tidak ada transaksi Prepaid di Tiket Detail.")
+
+        # ── Tabel 1: Tiket ESPAY tidak di Settlement ──────────
         st.markdown("---")
         hilang_set_df = df[df["Status"] == "Tidak di Settlement"][
             ["Order ID", "Nominal Tiket (Rp)", "Jml Tiket"]].copy()
 
-        # Gabungkan kolom Golongan dari df_espay
         df_espay_ss = st.session_state.df_espay
         if df_espay_ss is not None:
             golongan_map = (df_espay_ss.groupby("Order ID")["Golongan"]
@@ -488,11 +942,10 @@ with tab3:
         else:
             st.success("✅ Tidak ada tiket ESPAY yang hilang di Settlement.")
 
-        # ── Tabel 2: Order ID ada di Settlement tapi tidak ada di Tiket Detail ──
+        # ── Tabel 2: Settlement tidak di Tiket Detail ─────────
         st.markdown("---")
         lebih_set_df = df[df["Status"] == "Tidak di Tiket Detail"][["Order ID"]].copy()
 
-        # Gabungkan detail dari df_settle_raw
         if df_s_raw is not None and len(lebih_set_df):
             settle_detail = (df_s_raw[df_s_raw["Order ID"].isin(lebih_set_df["Order ID"])]
                              [["Order ID", "Transaction Date", "BANK", "Tipe", "Amount"]]
@@ -525,3 +978,234 @@ with tab3:
             )
         else:
             st.success("✅ Tidak ada Order ID di Settlement yang tidak ditemukan di Tiket Detail.")
+
+# ══════════════════════════════════════════════════════════════
+# TAB 4 — Data Bank
+# ══════════════════════════════════════════════════════════════
+with tab4:
+    df_bank_bri     = st.session_state.df_bank_bri
+    df_bank_bca     = st.session_state.df_bank_bca
+    df_bank_mandiri = st.session_state.df_bank_mandiri
+
+    has_bank = (
+        (df_bank_bri     is not None and len(df_bank_bri)     > 0) or
+        (df_bank_bca     is not None and len(df_bank_bca)     > 0) or
+        (df_bank_mandiri is not None and len(df_bank_mandiri) > 0)
+    )
+
+    if not has_bank:
+        st.info("Belum ada data rekening koran. Upload file Rekening Koran BRI/BCA di tab **Upload File** lalu klik **Proses Rekonsiliasi**.")
+    else:
+        st.markdown("### 🏦 Analisis Uang Masuk Rekening Koran Bank")
+
+        # Gabungkan semua data bank
+        bank_frames = []
+        if df_bank_bri is not None and len(df_bank_bri):
+            bank_frames.append(df_bank_bri)
+        if df_bank_bca is not None and len(df_bank_bca):
+            bank_frames.append(df_bank_bca)
+        if df_bank_mandiri is not None and len(df_bank_mandiri):
+            bank_frames.append(df_bank_mandiri)
+        df_all = pd.concat(bank_frames, ignore_index=True)
+
+        # ── Ringkasan Total per Bank ──────────────────────────
+        st.markdown("#### 📊 Ringkasan Total Uang Masuk per Bank")
+
+        summary_bank = (df_all.groupby(["Bank", "Kategori"])["Nominal"]
+                        .agg(["sum", "count"])
+                        .reset_index()
+                        .rename(columns={"sum": "Total (Rp)", "count": "Jumlah Transaksi"}))
+
+        for bank_name in df_all["Bank"].unique():
+            df_b = df_all[df_all["Bank"] == bank_name]
+            total_masuk = df_b["Nominal"].sum()
+            total_espay = df_b[df_b["Kategori"] == "ESPAY"]["Nominal"].sum()
+            total_prepaid = df_b[df_b["Kategori"].isin(["Prepaid", "Cash"])]["Nominal"].sum()
+            total_transfer = df_b[df_b["Kategori"] == "Transfer"]["Nominal"].sum()
+            total_lain = df_b[~df_b["Kategori"].isin(["ESPAY", "Prepaid", "Cash", "Transfer"])]["Nominal"].sum()
+            n_espay   = df_b[df_b["Kategori"] == "ESPAY"]["Nominal"].count()
+            n_prepaid = df_b[df_b["Kategori"].isin(["Prepaid", "Cash"])]["Nominal"].count()
+
+            st.markdown(f"##### 🏦 {bank_name}")
+            bk1, bk2, bk3, bk4 = st.columns(4)
+            with bk1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Total Uang Masuk</div>
+                    <div class="metric-value" style="color:#2563EB; font-size:15px">Rp {total_masuk:,.0f}</div>
+                </div>""", unsafe_allow_html=True)
+            with bk2:
+                st.markdown(f"""
+                <div class="green-card">
+                    <div style="font-size:13px;color:#166534">ESPAY (mrc)</div>
+                    <div style="font-size:16px;font-weight:700;color:#16A34A">Rp {total_espay:,.0f}</div>
+                    <div style="font-size:12px;color:#6B7280">{int(n_espay):,} transaksi</div>
+                </div>""", unsafe_allow_html=True)
+            with bk3:
+                st.markdown(f"""
+                <div class="purple-card">
+                    <div style="font-size:13px;color:#5B21B6">Prepaid (OnUs)</div>
+                    <div style="font-size:16px;font-weight:700;color:#7C3AED">Rp {total_prepaid:,.0f}</div>
+                    <div style="font-size:12px;color:#6B7280">{int(n_prepaid):,} transaksi</div>
+                </div>""", unsafe_allow_html=True)
+            with bk4:
+                st.markdown(f"""
+                <div class="bank-card">
+                    <div style="font-size:13px;color:#1E40AF">Transfer / Lainnya</div>
+                    <div style="font-size:16px;font-weight:700;color:#2563EB">Rp {total_transfer + total_lain:,.0f}</div>
+                    <div style="font-size:12px;color:#6B7280">&nbsp;</div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("")
+
+        # ── Tabel ringkasan per bank & kategori ──────────────
+        st.markdown("#### 📋 Tabel Ringkasan per Bank & Kategori")
+        summary_pivot = summary_bank.copy()
+        summary_pivot["Total (Rp)"] = summary_pivot["Total (Rp)"].apply(lambda x: f"Rp {x:,.0f}")
+        st.dataframe(summary_pivot, use_container_width=True, hide_index=True)
+
+        # ── Grafik harian per bank ────────────────────────────
+        st.markdown("---")
+        st.markdown("#### 📈 Grafik Uang Masuk Harian — ESPAY vs Prepaid")
+
+        import json
+
+        for bank_name in df_all["Bank"].unique():
+            df_b = df_all[df_all["Bank"] == bank_name].copy()
+            df_b["Tgl"] = pd.to_datetime(df_b["Tanggal"], errors="coerce").dt.normalize()
+            df_b = df_b[df_b["Tgl"].notna()]
+
+            # Harian per kategori
+            espay_daily = (df_b[df_b["Kategori"] == "ESPAY"]
+                           .groupby("Tgl")["Nominal"].sum()
+                           .reset_index()
+                           .rename(columns={"Nominal": "ESPAY"}))
+            prepaid_daily = (df_b[df_b["Kategori"].isin(["Prepaid", "Cash"])]
+                             .groupby("Tgl")["Nominal"].sum()
+                             .reset_index()
+                             .rename(columns={"Nominal": "Prepaid/OnUs"}))
+
+            all_dates = pd.date_range(df_b["Tgl"].min(), df_b["Tgl"].max())
+            daily = pd.DataFrame({"Tgl": all_dates})
+            daily = daily.merge(espay_daily, on="Tgl", how="left")
+            daily = daily.merge(prepaid_daily, on="Tgl", how="left")
+            daily = daily.fillna(0)
+            daily["Label"] = daily["Tgl"].dt.strftime("%d %b")
+
+            labels      = daily["Label"].tolist()
+            espay_vals  = daily["ESPAY"].tolist()
+            prepaid_vals = daily["Prepaid/OnUs"].tolist()
+
+            chart_html = f"""
+<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:16px;margin-bottom:24px">
+  <h4 style="margin:0 0 12px;color:#1E293B;font-size:15px">🏦 {bank_name} — Uang Masuk Harian</h4>
+  <canvas id="chart_{bank_name}" height="200"></canvas>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+(function() {{
+  var ctx = document.getElementById('chart_{bank_name}').getContext('2d');
+  new Chart(ctx, {{
+    type: 'bar',
+    data: {{
+      labels: {json.dumps(labels)},
+      datasets: [
+        {{
+          label: 'ESPAY (mrc)',
+          data: {json.dumps(espay_vals)},
+          backgroundColor: 'rgba(22,163,74,0.7)',
+          borderColor: '#16A34A',
+          borderWidth: 1,
+          borderRadius: 4,
+        }},
+        {{
+          label: 'Prepaid (OnUs)',
+          data: {json.dumps(prepaid_vals)},
+          backgroundColor: 'rgba(124,58,237,0.7)',
+          borderColor: '#7C3AED',
+          borderWidth: 1,
+          borderRadius: 4,
+        }}
+      ]
+    }},
+    options: {{
+      responsive: true,
+      plugins: {{
+        legend: {{ position: 'top' }},
+        tooltip: {{
+          callbacks: {{
+            label: function(ctx) {{
+              return ctx.dataset.label + ': Rp ' + ctx.parsed.y.toLocaleString('id-ID');
+            }}
+          }}
+        }}
+      }},
+      scales: {{
+        x: {{ stacked: false }},
+        y: {{
+          stacked: false,
+          ticks: {{
+            callback: function(v) {{
+              if(v >= 1000000) return 'Rp ' + (v/1000000).toFixed(1) + ' Jt';
+              return 'Rp ' + v.toLocaleString('id-ID');
+            }}
+          }}
+        }}
+      }}
+    }}
+  }});
+}})();
+</script>
+"""
+            st.components.v1.html(chart_html, height=320)
+
+        # ── Detail transaksi per bank ─────────────────────────
+        st.markdown("---")
+        st.markdown("#### 🔎 Detail Transaksi Rekening Koran")
+
+        sel_bank = st.selectbox(
+            "Pilih Bank",
+            options=df_all["Bank"].unique().tolist(),
+            key="bank_detail_select"
+        )
+        sel_kat = st.selectbox(
+            "Filter Kategori",
+            options=["Semua"] + sorted(df_all["Kategori"].unique().tolist()),
+            key="kat_detail_select"
+        )
+
+        df_detail = df_all[df_all["Bank"] == sel_bank].copy()
+        if sel_kat != "Semua":
+            df_detail = df_detail[df_detail["Kategori"] == sel_kat]
+
+        df_detail["Tanggal"] = pd.to_datetime(df_detail["Tanggal"], errors="coerce").dt.strftime("%d %b %Y")
+
+        disp_cols = ["Tanggal", "Keterangan", "Nominal", "Kategori", "Tipe", "Order Ref"]
+        df_disp = df_detail[[c for c in disp_cols if c in df_detail.columns]].copy()
+
+        def color_kat(val):
+            if val == "ESPAY":
+                return "background-color:#F0FDF4; color:#16A34A"
+            elif val in ("Prepaid", "Cash"):
+                return "background-color:#F5F3FF; color:#7C3AED"
+            elif val == "Transfer":
+                return "background-color:#EFF6FF; color:#1D4ED8"
+            return ""
+
+        styled_det = df_disp.style.map(color_kat, subset=["Kategori"]).format({"Nominal": "{:,.0f}"})
+        st.dataframe(styled_det, use_container_width=True, hide_index=True,
+                     height=min(500, 35 * len(df_disp) + 38))
+
+        # Download detail
+        buf_bank = io.BytesIO()
+        with pd.ExcelWriter(buf_bank, engine="openpyxl") as w:
+            for bank_name in df_all["Bank"].unique():
+                df_all[df_all["Bank"] == bank_name].drop(columns=[], errors="ignore").to_excel(
+                    w, index=False, sheet_name=f"Bank {bank_name}"[:31]
+                )
+        st.download_button(
+            "⬇️ Download Data Bank (Excel)",
+            data=buf_bank.getvalue(),
+            file_name=f"data_bank_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
