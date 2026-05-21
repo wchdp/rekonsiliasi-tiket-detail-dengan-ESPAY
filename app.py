@@ -239,47 +239,83 @@ def classify_bank_row(keterangan: str, nominal: float, bank_type: str,
     }
 
 
+def _parse_tanggal(series: pd.Series) -> pd.Series:
+    """
+    Parse kolom tanggal dengan benar untuk semua format bank.
+
+    Format yang ada:
+    - BCA/Mandiri: YYYY-MM-DD (ISO) atau YYYY-MM-DD HH:MM:SS → dayfirst=False
+    - BRI        : DD-MM-YYYY (misal '01-02-2026')           → dayfirst=True
+
+    Deteksi dilakukan dengan melihat panjang bagian pertama sebelum '-':
+    - len 4 → YYYY-MM-DD → dayfirst=False
+    - len 1-2 → DD-MM-YYYY → dayfirst=True
+    """
+    sample = series.dropna().astype(str).head(10)
+    use_dayfirst = False
+    for val in sample:
+        # Hilangkan bagian waktu (HH:MM:SS) jika ada
+        val_clean = str(val).split(' ')[0].strip()
+        parts = val_clean.replace('/', '-').split('-')
+        if len(parts) == 3:
+            try:
+                p0 = parts[0]
+                if len(p0) == 4:        # YYYY-MM-DD → ISO, dayfirst=False
+                    use_dayfirst = False
+                    break
+                elif len(p0) <= 2:      # DD-MM-YYYY → dayfirst=True
+                    use_dayfirst = True
+                    break
+            except Exception:
+                pass
+    try:
+        return pd.to_datetime(series, dayfirst=use_dayfirst, errors="coerce")
+    except Exception:
+        return pd.to_datetime(series, errors="coerce")
+
+
 def process_bank_file(file, bank_type: str,
                       espay_settlement_df: pd.DataFrame | None) -> pd.DataFrame:
     """
-    Baca rekening koran excel.
-    Format BCA/BRI dari file rekonsiliasi: header di baris 14, data mulai baris 16.
-    Kolom: DATE(A) | TIME(C) | REMARK/Keterangan(D) | DEBET(F) | CREDIT/KREDIT(G)
+    Baca rekening koran excel untuk BCA, BRI, dan Mandiri.
+
+    Format yang didukung (deteksi otomatis):
+    - BCA  : header=0, kolom DATE | TIME | REMARK | SALDO AWAL | DEBET | CREDIT | SALDO AKHIR
+    - BRI  : header=0, kolom Unnamed:0(tanggal) | REMARK | SALDO AWAL | DEBET | CREDIT
+             Tanggal format DD-MM-YYYY → wajib dayfirst=True
+    - MANDIRI: header=0, kolom Tanggal | Remark | Debit | Credit
+
     Hanya baris dengan CREDIT > 0 (uang masuk) yang diproses.
     """
     xl = pd.ExcelFile(file)
 
-    # Pilih sheet: prioritaskan yang mengandung nama bank atau koran/mutasi
+    # ── Pilih sheet ───────────────────────────────────────────
     target_sheet = xl.sheet_names[0]
-    bank_keywords = {
-        "BRI": ["bri"],
-        "BCA": ["bca"],
-        "MANDIRI": ["mandiri"],
-    }
+    bank_keywords = {"BRI": ["bri"], "BCA": ["bca"], "MANDIRI": ["mandiri"]}
     for s in xl.sheet_names:
         sl = s.lower()
-        # Cek keyword bank dulu
-        kws = bank_keywords.get(bank_type, [])
-        if any(k in sl for k in kws):
+        if any(k in sl for k in bank_keywords.get(bank_type, [])):
             target_sheet = s
             break
         if any(x in sl for x in ["koran", "mutasi", "rekening"]):
             target_sheet = s
             break
 
-    # ── Coba baca dengan header=13 (baris ke-14, 0-indexed) ──
-    # Format BCA/BRI dalam file rekonsiliasi punya header di baris 14
+    # ── Baca file ─────────────────────────────────────────────
+    # Coba berbagai posisi header; pilih yang punya kolom kredit
     df = None
-    for header_row in [13, 0, 1, 2, 3]:
+    for header_row in [0, 1, 2, 3, 13]:
         try:
             df_try = pd.read_excel(file, sheet_name=target_sheet,
                                    header=header_row, dtype=str)
-            df_try.columns = df_try.columns.str.strip()
-            # Validasi: harus ada kolom date-like dan credit-like
-            cols_l = [c.lower() for c in df_try.columns]
-            has_date   = any(x in c for c in cols_l for x in ["date", "tanggal", "tgl"])
-            has_credit = any(x in c for c in cols_l for x in ["credit", "kredit", "masuk", "nominal"])
-            if has_date and has_credit:
+            df_try.columns = [
+                (c.strip() if isinstance(c, str) else c)
+                for c in df_try.columns
+            ]
+            cols_l = [str(c).lower() for c in df_try.columns]
+            has_credit = any(x in c for c in cols_l
+                             for x in ["credit", "kredit", "masuk", "nominal"])
+            if has_credit:
                 df = df_try
                 break
         except Exception:
@@ -287,12 +323,28 @@ def process_bank_file(file, bank_type: str,
 
     if df is None:
         df = pd.read_excel(file, sheet_name=target_sheet, dtype=str)
-        df.columns = df.columns.str.strip()
+        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+
+    # ── Rename kolom tanpa nama (BRI: kolom tanggal = Unnamed: 0) ──
+    # Jika kolom pertama adalah Unnamed dan kolom kedua adalah REMARK/keterangan,
+    # maka kolom pertama pasti Tanggal.
+    unnamed_first = str(df.columns[0]).startswith("Unnamed") or df.columns[0] != df.columns[0]
+    if unnamed_first:
+        # Cek apakah kolom pertama berisi data tanggal
+        sample_vals = df.iloc[:5, 0].dropna().astype(str).tolist()
+        looks_like_date = any(
+            any(c.isdigit() for c in v) and ("-" in v or "/" in v)
+            for v in sample_vals
+        )
+        if looks_like_date:
+            cols = list(df.columns)
+            cols[0] = "Tanggal"
+            df.columns = cols
 
     # ── Deteksi kolom Tanggal ──────────────────────────────────
     tgl_col = None
     for c in df.columns:
-        cl = c.lower()
+        cl = str(c).lower()
         if any(x in cl for x in ["date", "tanggal", "tgl"]):
             tgl_col = c
             break
@@ -302,32 +354,34 @@ def process_bank_file(file, bank_type: str,
     # ── Deteksi kolom Keterangan ──────────────────────────────
     ket_col = None
     for c in df.columns:
-        cl = c.lower()
+        cl = str(c).lower()
         if any(x in cl for x in ["remark", "keterangan", "deskripsi", "description", "uraian"]):
             ket_col = c
             break
     if ket_col is None:
-        # Fallback: kolom D (index 3) biasanya REMARK di BCA/BRI
-        ket_col = df.columns[3] if len(df.columns) > 3 else df.columns[1]
+        ket_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
 
     # ── Deteksi kolom Kredit (uang masuk) ─────────────────────
-    # BCA/BRI pakai "CREDIT" (col G, index 6); hindari "DEBET"
+    # Cari "credit"/"kredit"/"masuk" — eksplisit hindari "debet"/"debit"
     nom_col = None
     for c in df.columns:
-        cl = c.lower()
-        if any(x in cl for x in ["credit", "kredit", "masuk"]):
+        cl = str(c).lower()
+        if any(x in cl for x in ["credit", "kredit", "masuk"]) and \
+           "debet" not in cl and "debit" not in cl:
             nom_col = c
             break
     if nom_col is None:
-        # Fallback: "nominal", "amount", "jumlah" yang BUKAN debet
         for c in df.columns:
-            cl = c.lower()
-            if any(x in cl for x in ["nominal", "amount", "jumlah"]) and "debet" not in cl and "debit" not in cl:
+            cl = str(c).lower()
+            if any(x in cl for x in ["nominal", "amount", "jumlah"]) and \
+               "debet" not in cl and "debit" not in cl:
                 nom_col = c
                 break
     if nom_col is None:
-        nom_col = df.columns[6] if len(df.columns) > 6 else df.columns[2]
+        # Fallback posisi: col G (index 6) untuk BCA/BRI, col D (index 3) untuk Mandiri
+        nom_col = df.columns[min(6, len(df.columns) - 1)]
 
+    # ── Susun dataframe kerja ──────────────────────────────────
     df = df[[tgl_col, ket_col, nom_col]].copy()
     df.columns = ["Tanggal", "Keterangan", "Nominal"]
 
@@ -340,8 +394,8 @@ def process_bank_file(file, bank_type: str,
     )
     df["Nominal"] = pd.to_numeric(df["Nominal"], errors="coerce").fillna(0)
 
-    # ── Bersihkan tanggal ──────────────────────────────────────
-    df["Tanggal"] = pd.to_datetime(df["Tanggal"], errors="coerce")
+    # ── Parse tanggal (handle DD-MM-YYYY untuk BRI) ───────────
+    df["Tanggal"] = _parse_tanggal(df["Tanggal"])
 
     # ── Filter: uang masuk (Nominal > 0) dan tanggal valid ────
     df = df[(df["Nominal"] > 0) & (df["Tanggal"].notna())].copy()
