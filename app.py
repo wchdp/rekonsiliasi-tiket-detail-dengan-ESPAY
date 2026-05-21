@@ -121,84 +121,116 @@ def extract_mrc_id(keterangan: str) -> str | None:
 def classify_bank_row(keterangan: str, nominal: float, bank_type: str,
                       espay_settlement_df: pd.DataFrame | None) -> dict:
     """
-    Klasifikasi satu baris rekening koran sesuai rumus Excel:
+    Klasifikasi satu baris rekening koran sesuai rumus Excel di sheet BCA dan BRI CASHLESS.
 
-    BRI:
-      - Jika ada 'mrc' → cari di Settlement Espay → dapat = ESPAY / tidak dapat = Prepaid
-      - Jika ada 'Pinbuk' → Transfer NON BCA
-      - Lainnya → Prepaid (OnUs)
+    Rumus Excel (col K = Kategori, col L = Tipe) di kedua sheet identik polanya:
 
-    BCA:
-      - Jika ada 'mrc' → cari di Settlement Espay → dapat = ESPAY / tidak dapat = Cash
-      - Jika ada 'KR OTOMATIS' DAN 'MID' → Transfer BCA
-      - Lainnya → Cash
+    BRI (col K):
+      =IF(ISNUMBER(SEARCH("mrc",$D)),
+          IFERROR(INDEX(Settlement!$AA, MATCH(MID($D,SEARCH("mrc",$D),18), Settlement!$R, 0)),
+                  "Prepaid"),
+          IF(ISNUMBER(SEARCH("Pinbuk",$D)), "NON BCA", "Prepaid"))
 
-    MANDIRI:
-      - Jika ada 'mrc' → cari di Settlement Espay → dapat = ESPAY / tidak dapat = Prepaid
-      - Jika ada 'SWITCHING' atau 'EDC' atau 'MTRANSFER' → Transfer / NON MANDIRI
-      - Lainnya → Prepaid (OnUs)
+    BCA (col K):
+      =IF(ISNUMBER(SEARCH("mrc",$D)),
+          IFERROR(INDEX(Settlement!$AA, MATCH(MID($D,SEARCH("mrc",$D),18), Settlement!$R, 0)),
+                  "Cash"),
+          IF(AND(ISNUMBER(SEARCH("KR OTOMATIS",$D)), ISNUMBER(SEARCH("MID",$D))), "BCA", "Cash"))
+
+    Settlement Espay:
+      - Col R (idx 17) = Settlement Remark  → berisi nilai mrc... untuk di-MATCH
+      - Col Y (idx 24) = Type               → "Go Show" / "Online"
+      - Col AA (idx 26) = BANK              → "BCA", "NON BCA", dll
+
+    Jika ditemukan di Settlement:
+      - kategori = nilai col AA (BANK), mis. "NON BCA", "BCA"
+      - tipe     = nilai col Y  (Type), mis. "Go Show", "Online"
+    Jika mrc ada tapi tidak ditemukan di Settlement:
+      - BRI/MANDIRI → kategori = "Prepaid", tipe = "Prepaid"
+      - BCA         → kategori = "Cash",    tipe = "Cash"
+    Jika tidak ada mrc:
+      - BRI: "Pinbuk" → kategori="NON BCA", tipe="Go Show" | lainnya → "Prepaid"
+      - BCA: "KR OTOMATIS"+"MID" → kategori="BCA", tipe="Go Show" | lainnya → "Cash"
+      - MANDIRI: "SWITCHING"/"EDC"/"MTRANSFER" → kategori="NON MANDIRI" | lainnya → "Prepaid"
     """
     ket = str(keterangan)
-    ket_up = ket.upper()
     mrc_id = extract_mrc_id(ket)
 
-    kategori   = "Lainnya"
-    tipe       = "-"
+    kategori    = "Lainnya"
+    tipe        = "-"
     order_match = None
 
+    # Kolom Settlement Espay sesuai header Excel:
+    # R = Settlement Remark (idx 17), Y = Type (idx 24), AA = BANK (idx 26)
+    COL_R  = "Settlement Remark"   # col R, idx 17
+    COL_Y  = "Type"                # col Y, idx 24 — nama duplikat; pakai posisi
+    COL_AA = "BANK"                # col AA, idx 26
+
     if mrc_id and espay_settlement_df is not None and len(espay_settlement_df):
-        # Coba match ke kolom R (Transaction ID / referensi) di Settlement Espay
-        # Kolom R = indeks 17 (0-based)
-        ref_col    = espay_settlement_df.columns[17] if len(espay_settlement_df.columns) > 17 else None
-        tipe_col   = espay_settlement_df.columns[24] if len(espay_settlement_df.columns) > 24 else None  # col Y
-        status_col = espay_settlement_df.columns[26] if len(espay_settlement_df.columns) > 26 else None  # col AA
+        cols = espay_settlement_df.columns.tolist()
+
+        # Pakai nama kolom jika ada, fallback ke indeks posisi
+        ref_col    = COL_R  if COL_R  in cols else (cols[17] if len(cols) > 17 else None)
+        # col Y (Type) — ada dua kolom "Type" (T dan Y); ambil indeks 24
+        tipe_col   = cols[24] if len(cols) > 24 else None
+        bank_col   = COL_AA if COL_AA in cols else (cols[26] if len(cols) > 26 else None)
 
         if ref_col is not None:
+            # Match persis 18 karakter mrc ke col R
             matched = espay_settlement_df[
-                espay_settlement_df[ref_col].astype(str).str.strip().str[:18] == mrc_id.strip()
+                espay_settlement_df[ref_col].astype(str).str.strip() == mrc_id.strip()
             ]
             if len(matched):
-                kategori    = "ESPAY"
+                # Ditemukan → ambil BANK (col AA) sebagai kategori, Type (col Y) sebagai tipe
                 order_match = mrc_id
-                if status_col and status_col in espay_settlement_df.columns:
-                    tipe = str(matched.iloc[0][status_col])
-                elif tipe_col and tipe_col in espay_settlement_df.columns:
-                    tipe = str(matched.iloc[0][tipe_col])
-                else:
-                    tipe = "ESPAY"
+                kategori = str(matched.iloc[0][bank_col]).strip() if bank_col else "ESPAY"
+                tipe     = str(matched.iloc[0][tipe_col]).strip() if tipe_col else "-"
             else:
-                # Tidak ketemu di settlement → Prepaid/Cash sesuai bank
-                kategori = "Prepaid" if bank_type in ("BRI", "MANDIRI") else "Cash"
-                tipe     = "OnUs"
+                # Tidak ditemukan di Settlement
+                if bank_type in ("BRI", "MANDIRI"):
+                    kategori = "Prepaid"
+                    tipe     = "Prepaid"
+                else:  # BCA
+                    kategori = "Cash"
+                    tipe     = "Cash"
         else:
-            kategori = "Prepaid" if bank_type in ("BRI", "MANDIRI") else "Cash"
-            tipe     = "OnUs"
+            if bank_type in ("BRI", "MANDIRI"):
+                kategori, tipe = "Prepaid", "Prepaid"
+            else:
+                kategori, tipe = "Cash", "Cash"
 
     else:
-        # Tidak ada 'mrc'
+        # Tidak ada 'mrc' dalam keterangan
+        ket_lower = ket.lower()
+
         if bank_type == "BRI":
-            if "PINBUK" in ket_up:
-                kategori = "Transfer"
-                tipe     = "NON BCA"
+            # Excel: IF(ISNUMBER(SEARCH("Pinbuk",$D)), "NON BCA", "Prepaid")
+            # SEARCH di Excel case-insensitive
+            if "pinbuk" in ket_lower:
+                kategori = "NON BCA"
+                tipe     = "Go Show"
             else:
                 kategori = "Prepaid"
-                tipe     = "OnUs"
+                tipe     = "Prepaid"
 
         elif bank_type == "BCA":
+            # Excel: IF(AND(ISNUMBER(SEARCH("KR OTOMATIS",$D)), ISNUMBER(SEARCH("MID",$D))), "BCA", "Cash")
+            ket_up = ket.upper()
             if "KR OTOMATIS" in ket_up and "MID" in ket_up:
-                kategori = "Transfer"
-                tipe     = "BCA"
+                kategori = "BCA"
+                tipe     = "Go Show"
             else:
                 kategori = "Cash"
                 tipe     = "Cash"
 
         elif bank_type == "MANDIRI":
+            ket_up = ket.upper()
             if any(x in ket_up for x in ["SWITCHING", "EDC", "MTRANSFER", "TRANSFER"]):
-                kategori = "Transfer"
-                tipe     = "NON MANDIRI"
+                kategori = "NON MANDIRI"
+                tipe     = "Go Show"
             else:
                 kategori = "Prepaid"
-                tipe     = "OnUs"
+                tipe     = "Prepaid"
 
     return {
         "kategori":  kategori,
@@ -211,51 +243,95 @@ def process_bank_file(file, bank_type: str,
                       espay_settlement_df: pd.DataFrame | None) -> pd.DataFrame:
     """
     Baca rekening koran excel.
-    Format yang didukung: kolom Tanggal | Keterangan | Nominal (kredit/debet).
-    Hanya baris dengan Nominal > 0 (uang masuk) yang diproses.
+    Format BCA/BRI dari file rekonsiliasi: header di baris 14, data mulai baris 16.
+    Kolom: DATE(A) | TIME(C) | REMARK/Keterangan(D) | DEBET(F) | CREDIT/KREDIT(G)
+    Hanya baris dengan CREDIT > 0 (uang masuk) yang diproses.
     """
-    # Baca semua sheet, coba sheet pertama atau yang mengandung 'koran'/'bank'
     xl = pd.ExcelFile(file)
+
+    # Pilih sheet: prioritaskan yang mengandung nama bank atau koran/mutasi
     target_sheet = xl.sheet_names[0]
+    bank_keywords = {
+        "BRI": ["bri"],
+        "BCA": ["bca"],
+        "MANDIRI": ["mandiri"],
+    }
     for s in xl.sheet_names:
-        if any(x in s.lower() for x in ["koran", "bank", "rekening", "mutasi"]):
+        sl = s.lower()
+        # Cek keyword bank dulu
+        kws = bank_keywords.get(bank_type, [])
+        if any(k in sl for k in kws):
+            target_sheet = s
+            break
+        if any(x in sl for x in ["koran", "mutasi", "rekening"]):
             target_sheet = s
             break
 
-    df = pd.read_excel(file, sheet_name=target_sheet, dtype=str)
-    df.columns = df.columns.str.strip()
+    # ── Coba baca dengan header=13 (baris ke-14, 0-indexed) ──
+    # Format BCA/BRI dalam file rekonsiliasi punya header di baris 14
+    df = None
+    for header_row in [13, 0, 1, 2, 3]:
+        try:
+            df_try = pd.read_excel(file, sheet_name=target_sheet,
+                                   header=header_row, dtype=str)
+            df_try.columns = df_try.columns.str.strip()
+            # Validasi: harus ada kolom date-like dan credit-like
+            cols_l = [c.lower() for c in df_try.columns]
+            has_date   = any(x in c for c in cols_l for x in ["date", "tanggal", "tgl"])
+            has_credit = any(x in c for c in cols_l for x in ["credit", "kredit", "masuk", "nominal"])
+            if has_date and has_credit:
+                df = df_try
+                break
+        except Exception:
+            continue
 
-    # Deteksi kolom Tanggal
+    if df is None:
+        df = pd.read_excel(file, sheet_name=target_sheet, dtype=str)
+        df.columns = df.columns.str.strip()
+
+    # ── Deteksi kolom Tanggal ──────────────────────────────────
     tgl_col = None
     for c in df.columns:
-        if any(x in c.lower() for x in ["tanggal", "date", "tgl"]):
+        cl = c.lower()
+        if any(x in cl for x in ["date", "tanggal", "tgl"]):
             tgl_col = c
             break
     if tgl_col is None:
         tgl_col = df.columns[0]
 
-    # Deteksi kolom Keterangan
+    # ── Deteksi kolom Keterangan ──────────────────────────────
     ket_col = None
     for c in df.columns:
-        if any(x in c.lower() for x in ["keterangan", "deskripsi", "description", "remark", "uraian"]):
+        cl = c.lower()
+        if any(x in cl for x in ["remark", "keterangan", "deskripsi", "description", "uraian"]):
             ket_col = c
             break
     if ket_col is None:
-        ket_col = df.columns[1]
+        # Fallback: kolom D (index 3) biasanya REMARK di BCA/BRI
+        ket_col = df.columns[3] if len(df.columns) > 3 else df.columns[1]
 
-    # Deteksi kolom Nominal (kredit / masuk)
+    # ── Deteksi kolom Kredit (uang masuk) ─────────────────────
+    # BCA/BRI pakai "CREDIT" (col G, index 6); hindari "DEBET"
     nom_col = None
     for c in df.columns:
-        if any(x in c.lower() for x in ["kredit", "masuk", "credit", "nominal", "jumlah", "amount"]):
+        cl = c.lower()
+        if any(x in cl for x in ["credit", "kredit", "masuk"]):
             nom_col = c
             break
     if nom_col is None:
-        nom_col = df.columns[2]
+        # Fallback: "nominal", "amount", "jumlah" yang BUKAN debet
+        for c in df.columns:
+            cl = c.lower()
+            if any(x in cl for x in ["nominal", "amount", "jumlah"]) and "debet" not in cl and "debit" not in cl:
+                nom_col = c
+                break
+    if nom_col is None:
+        nom_col = df.columns[6] if len(df.columns) > 6 else df.columns[2]
 
     df = df[[tgl_col, ket_col, nom_col]].copy()
     df.columns = ["Tanggal", "Keterangan", "Nominal"]
 
-    # Bersihkan nominal
+    # ── Bersihkan nominal ──────────────────────────────────────
     df["Nominal"] = (
         df["Nominal"]
         .astype(str)
@@ -264,17 +340,17 @@ def process_bank_file(file, bank_type: str,
     )
     df["Nominal"] = pd.to_numeric(df["Nominal"], errors="coerce").fillna(0)
 
-    # Bersihkan tanggal
+    # ── Bersihkan tanggal ──────────────────────────────────────
     df["Tanggal"] = pd.to_datetime(df["Tanggal"], errors="coerce")
 
-    # Hanya baris uang masuk (Nominal > 0) dan tanggal valid
+    # ── Filter: uang masuk (Nominal > 0) dan tanggal valid ────
     df = df[(df["Nominal"] > 0) & (df["Tanggal"].notna())].copy()
     df = df.reset_index(drop=True)
 
     if len(df) == 0:
         return df
 
-    # Klasifikasi
+    # ── Klasifikasi ────────────────────────────────────────────
     results = df.apply(
         lambda row: classify_bank_row(
             row["Keterangan"], row["Nominal"], bank_type, espay_settlement_df
@@ -282,10 +358,10 @@ def process_bank_file(file, bank_type: str,
         axis=1,
         result_type="expand",
     )
-    df["Kategori"]   = results["kategori"]
-    df["Tipe"]       = results["tipe"]
-    df["Order Ref"]  = results["order_ref"]
-    df["Bank"]       = bank_type
+    df["Kategori"]  = results["kategori"]
+    df["Tipe"]      = results["tipe"]
+    df["Order Ref"] = results["order_ref"]
+    df["Bank"]      = bank_type
 
     return df
 
@@ -328,7 +404,9 @@ def detect_prepaid_shortfall(df_prepaid_raw: pd.DataFrame,
         return daily_tiket
 
     # Hitung uang masuk Prepaid / OnUs di rekening koran
-    df_b = df_bank[df_bank["Kategori"].isin(["Prepaid", "Cash"])].copy()
+    # Kategori Prepaid mencakup: "Prepaid", "Cash" (BCA tanpa mrc), "NON BCA" (BRI Pinbuk), "NON MANDIRI"
+    PREPAID_CATEGORIES = {"Prepaid", "Cash"}
+    df_b = df_bank[df_bank["Kategori"].isin(PREPAID_CATEGORIES)].copy()
     df_b["_tgl"] = pd.to_datetime(df_b["Tanggal"], errors="coerce").dt.normalize()
     daily_bank = (
         df_b[df_b["_tgl"].notna()]
@@ -1019,12 +1097,20 @@ with tab4:
         for bank_name in df_all["Bank"].unique():
             df_b = df_all[df_all["Bank"] == bank_name]
             total_masuk = df_b["Nominal"].sum()
-            total_espay = df_b[df_b["Kategori"] == "ESPAY"]["Nominal"].sum()
-            total_prepaid = df_b[df_b["Kategori"].isin(["Prepaid", "Cash"])]["Nominal"].sum()
-            total_transfer = df_b[df_b["Kategori"] == "Transfer"]["Nominal"].sum()
-            total_lain = df_b[~df_b["Kategori"].isin(["ESPAY", "Prepaid", "Cash", "Transfer"])]["Nominal"].sum()
-            n_espay   = df_b[df_b["Kategori"] == "ESPAY"]["Nominal"].count()
-            n_prepaid = df_b[df_b["Kategori"].isin(["Prepaid", "Cash"])]["Nominal"].count()
+
+            # Kategori ESPAY: baris yang berhasil di-match ke Settlement (mrc found)
+            # → kategori berisi nilai BANK dari col AA: "NON BCA", "BCA", dll (bukan "ESPAY")
+            # Deteksi ESPAY = baris yang punya Order Ref (mrc match)
+            espay_mask    = df_b["Order Ref"].notna()
+            prepaid_mask  = df_b["Kategori"].isin(["Prepaid", "Cash"])
+            transfer_mask = df_b["Kategori"].isin(["NON BCA", "NON MANDIRI", "BCA"])
+
+            total_espay    = df_b[espay_mask]["Nominal"].sum()
+            total_prepaid  = df_b[prepaid_mask]["Nominal"].sum()
+            total_transfer = df_b[transfer_mask & ~espay_mask]["Nominal"].sum()
+            total_lain     = df_b[~espay_mask & ~prepaid_mask & ~transfer_mask]["Nominal"].sum()
+            n_espay   = espay_mask.sum()
+            n_prepaid = prepaid_mask.sum()
 
             st.markdown(f"##### 🏦 {bank_name}")
             bk1, bk2, bk3, bk4 = st.columns(4)
